@@ -1,6 +1,7 @@
 #include "include/lull_audio/lull_audio_plugin.h"
 
 #include <flutter_linux/flutter_linux.h>
+#include <gio/gio.h>
 #include <glib/gstdio.h>
 #include <gtk/gtk.h>
 #include <gst/gst.h>
@@ -32,12 +33,26 @@ struct _LullAudioPlugin {
   gint current_chunk_index;
   gboolean has_uri;
 
-  // Now-Playing metadata (consumed by the MPRIS layer, added next).
+  // Now-Playing metadata (published via MPRIS).
   gchar* np_title;
   gchar* np_artist;
+  gchar* np_art_url;
+  gint64 np_length_us;
+
+  // MPRIS (D-Bus) state.
+  guint mpris_owner_id;
+  GDBusConnection* mpris_conn;
+  guint mpris_root_reg;
+  guint mpris_player_reg;
+  gboolean mpris_playing;
+  gint64 mpris_position_us;
 };
 
 G_DEFINE_TYPE(LullAudioPlugin, lull_audio_plugin, g_object_get_type())
+
+// Forward declarations (MPRIS layer is defined further down).
+static void mpris_emit_changed(LullAudioPlugin* self);
+static void mpris_setup(LullAudioPlugin* self);
 
 // ─── State events ────────────────────────────────────────────────────────────
 
@@ -63,6 +78,14 @@ static void send_state_event(LullAudioPlugin* self) {
 
   GstState state = GST_STATE_NULL;
   gst_element_get_state(self->playbin, &state, nullptr, 0);
+
+  // Keep MPRIS in sync: position is read on demand; emit on play/pause change.
+  self->mpris_position_us = pos_ns >= 0 ? pos_ns / 1000 : 0;
+  gboolean playing = (state == GST_STATE_PLAYING);
+  if (playing != self->mpris_playing) {
+    self->mpris_playing = playing;
+    mpris_emit_changed(self);
+  }
 
   g_autoptr(FlValue) map = fl_value_new_map();
   fl_value_set_string_take(map, "type", fl_value_new_string("state"));
@@ -94,6 +117,20 @@ static void send_completed_event(LullAudioPlugin* self) {
 static gboolean position_tick(gpointer user_data) {
   send_state_event(LULL_AUDIO_PLUGIN(user_data));
   return G_SOURCE_CONTINUE;
+}
+
+// Forwards a system transport command (e.g. from MPRIS) to the Dart
+// commandStream. [position_ms] >= 0 only for seek.
+static void send_command_event(LullAudioPlugin* self, const gchar* command,
+                               gint64 position_ms) {
+  if (!self->listening || self->event_channel == nullptr) return;
+  g_autoptr(FlValue) map = fl_value_new_map();
+  fl_value_set_string_take(map, "type", fl_value_new_string("command"));
+  fl_value_set_string_take(map, "command", fl_value_new_string(command));
+  if (position_ms >= 0) {
+    fl_value_set_string_take(map, "positionMs", fl_value_new_int(position_ms));
+  }
+  fl_event_channel_send(self->event_channel, map, nullptr, nullptr);
 }
 
 // ─── GStreamer bus + gapless ─────────────────────────────────────────────────
@@ -198,6 +235,200 @@ static void load_uri(LullAudioPlugin* self, gchar* uri /* takes ownership */) {
   g_free(uri);
 }
 
+// ─── MPRIS (org.mpris.MediaPlayer2, D-Bus session bus) ───────────────────────
+
+static const char kMprisXml[] =
+    "<node>"
+    "  <interface name='org.mpris.MediaPlayer2'>"
+    "    <method name='Raise'/>"
+    "    <method name='Quit'/>"
+    "    <property name='CanQuit' type='b' access='read'/>"
+    "    <property name='CanRaise' type='b' access='read'/>"
+    "    <property name='HasTrackList' type='b' access='read'/>"
+    "    <property name='Identity' type='s' access='read'/>"
+    "    <property name='SupportedUriSchemes' type='as' access='read'/>"
+    "    <property name='SupportedMimeTypes' type='as' access='read'/>"
+    "  </interface>"
+    "  <interface name='org.mpris.MediaPlayer2.Player'>"
+    "    <method name='Play'/>"
+    "    <method name='Pause'/>"
+    "    <method name='PlayPause'/>"
+    "    <method name='Stop'/>"
+    "    <method name='Next'/>"
+    "    <method name='Previous'/>"
+    "    <method name='Seek'><arg name='Offset' type='x' direction='in'/></method>"
+    "    <method name='SetPosition'><arg name='TrackId' type='o' direction='in'/>"
+    "      <arg name='Position' type='x' direction='in'/></method>"
+    "    <property name='PlaybackStatus' type='s' access='read'/>"
+    "    <property name='Metadata' type='a{sv}' access='read'/>"
+    "    <property name='Position' type='x' access='read'/>"
+    "    <property name='Rate' type='d' access='read'/>"
+    "    <property name='MinimumRate' type='d' access='read'/>"
+    "    <property name='MaximumRate' type='d' access='read'/>"
+    "    <property name='Volume' type='d' access='readwrite'/>"
+    "    <property name='CanGoNext' type='b' access='read'/>"
+    "    <property name='CanGoPrevious' type='b' access='read'/>"
+    "    <property name='CanPlay' type='b' access='read'/>"
+    "    <property name='CanPause' type='b' access='read'/>"
+    "    <property name='CanSeek' type='b' access='read'/>"
+    "    <property name='CanControl' type='b' access='read'/>"
+    "  </interface>"
+    "</node>";
+
+static GDBusNodeInfo* g_mpris_node = nullptr;
+
+static GVariant* mpris_metadata(LullAudioPlugin* self) {
+  GVariantBuilder b;
+  g_variant_builder_init(&b, G_VARIANT_TYPE("a{sv}"));
+  g_variant_builder_add(
+      &b, "{sv}", "mpris:trackid",
+      g_variant_new_object_path("/net/geraldhofbauer/lull_audio/track0"));
+  if (self->np_length_us > 0) {
+    g_variant_builder_add(&b, "{sv}", "mpris:length",
+                          g_variant_new_int64(self->np_length_us));
+  }
+  g_variant_builder_add(
+      &b, "{sv}", "xesam:title",
+      g_variant_new_string(self->np_title ? self->np_title : "Unknown"));
+  if (self->np_artist != nullptr) {
+    const gchar* arr[] = {self->np_artist, nullptr};
+    g_variant_builder_add(&b, "{sv}", "xesam:artist",
+                          g_variant_new_strv(arr, -1));
+  }
+  if (self->np_art_url != nullptr) {
+    g_variant_builder_add(&b, "{sv}", "mpris:artUrl",
+                          g_variant_new_string(self->np_art_url));
+  }
+  return g_variant_builder_end(&b);
+}
+
+static const char* mpris_status(LullAudioPlugin* self) {
+  return self->mpris_playing ? "Playing"
+                             : (self->has_uri ? "Paused" : "Stopped");
+}
+
+static void mpris_emit_changed(LullAudioPlugin* self) {
+  if (self->mpris_conn == nullptr) return;
+  GVariantBuilder props;
+  g_variant_builder_init(&props, G_VARIANT_TYPE("a{sv}"));
+  g_variant_builder_add(&props, "{sv}", "PlaybackStatus",
+                        g_variant_new_string(mpris_status(self)));
+  g_variant_builder_add(&props, "{sv}", "Metadata", mpris_metadata(self));
+  const gchar* empty[] = {nullptr};
+  g_dbus_connection_emit_signal(
+      self->mpris_conn, nullptr, "/org/mpris/MediaPlayer2",
+      "org.freedesktop.DBus.Properties", "PropertiesChanged",
+      g_variant_new("(s@a{sv}@as)", "org.mpris.MediaPlayer2.Player",
+                    g_variant_builder_end(&props),
+                    g_variant_new_strv(empty, -1)),
+      nullptr);
+}
+
+static void mpris_root_method(GDBusConnection*, const gchar*, const gchar*,
+                              const gchar*, const gchar*, GVariant*,
+                              GDBusMethodInvocation* inv, gpointer) {
+  g_dbus_method_invocation_return_value(inv, nullptr);  // Raise/Quit: no-op
+}
+
+static GVariant* mpris_root_get(GDBusConnection*, const gchar*, const gchar*,
+                                const gchar*, const gchar* prop, GError**,
+                                gpointer) {
+  if (!strcmp(prop, "Identity")) return g_variant_new_string("lull_audio");
+  if (!strcmp(prop, "CanQuit")) return g_variant_new_boolean(FALSE);
+  if (!strcmp(prop, "CanRaise")) return g_variant_new_boolean(FALSE);
+  if (!strcmp(prop, "HasTrackList")) return g_variant_new_boolean(FALSE);
+  if (!strcmp(prop, "SupportedUriSchemes") ||
+      !strcmp(prop, "SupportedMimeTypes")) {
+    const gchar* empty[] = {nullptr};
+    return g_variant_new_strv(empty, -1);
+  }
+  return nullptr;
+}
+
+static void mpris_player_method(GDBusConnection*, const gchar*, const gchar*,
+                                const gchar*, const gchar* method,
+                                GVariant* params, GDBusMethodInvocation* inv,
+                                gpointer user_data) {
+  LullAudioPlugin* self = LULL_AUDIO_PLUGIN(user_data);
+  if (!strcmp(method, "Play")) {
+    send_command_event(self, "play", -1);
+  } else if (!strcmp(method, "Pause")) {
+    send_command_event(self, "pause", -1);
+  } else if (!strcmp(method, "Stop")) {
+    send_command_event(self, "stop", -1);
+  } else if (!strcmp(method, "Next")) {
+    send_command_event(self, "next", -1);
+  } else if (!strcmp(method, "Previous")) {
+    send_command_event(self, "previous", -1);
+  } else if (!strcmp(method, "PlayPause")) {
+    send_command_event(self, self->mpris_playing ? "pause" : "play", -1);
+  } else if (!strcmp(method, "Seek")) {
+    gint64 offset_us = 0;
+    g_variant_get(params, "(x)", &offset_us);
+    gint64 target_ms = (self->mpris_position_us + offset_us) / 1000;
+    send_command_event(self, "seek", target_ms < 0 ? 0 : target_ms);
+  } else if (!strcmp(method, "SetPosition")) {
+    const gchar* path = nullptr;
+    gint64 pos_us = 0;
+    g_variant_get(params, "(&ox)", &path, &pos_us);
+    send_command_event(self, "seek", pos_us / 1000);
+  }
+  g_dbus_method_invocation_return_value(inv, nullptr);
+}
+
+static GVariant* mpris_player_get(GDBusConnection*, const gchar*, const gchar*,
+                                  const gchar*, const gchar* prop, GError**,
+                                  gpointer user_data) {
+  LullAudioPlugin* self = LULL_AUDIO_PLUGIN(user_data);
+  if (!strcmp(prop, "PlaybackStatus"))
+    return g_variant_new_string(mpris_status(self));
+  if (!strcmp(prop, "Metadata")) return mpris_metadata(self);
+  if (!strcmp(prop, "Position"))
+    return g_variant_new_int64(self->mpris_position_us);
+  if (!strcmp(prop, "Rate") || !strcmp(prop, "MinimumRate") ||
+      !strcmp(prop, "MaximumRate") || !strcmp(prop, "Volume"))
+    return g_variant_new_double(1.0);
+  if (!strcmp(prop, "CanControl") || !strcmp(prop, "CanPlay") ||
+      !strcmp(prop, "CanPause") || !strcmp(prop, "CanSeek") ||
+      !strcmp(prop, "CanGoNext") || !strcmp(prop, "CanGoPrevious"))
+    return g_variant_new_boolean(TRUE);
+  return nullptr;
+}
+
+static gboolean mpris_player_set(GDBusConnection*, const gchar*, const gchar*,
+                                 const gchar*, const gchar*, GVariant*,
+                                 GError**, gpointer) {
+  return TRUE;  // accept Volume writes (no-op)
+}
+
+static const GDBusInterfaceVTable kRootVtable = {mpris_root_method,
+                                                 mpris_root_get, nullptr, {}};
+static const GDBusInterfaceVTable kPlayerVtable = {
+    mpris_player_method, mpris_player_get, mpris_player_set, {}};
+
+static void mpris_on_bus_acquired(GDBusConnection* conn, const gchar*,
+                                  gpointer user_data) {
+  LullAudioPlugin* self = LULL_AUDIO_PLUGIN(user_data);
+  self->mpris_conn = conn;
+  if (g_mpris_node == nullptr) {
+    g_mpris_node = g_dbus_node_info_new_for_xml(kMprisXml, nullptr);
+  }
+  if (g_mpris_node == nullptr) return;
+  self->mpris_root_reg = g_dbus_connection_register_object(
+      conn, "/org/mpris/MediaPlayer2", g_mpris_node->interfaces[0],
+      &kRootVtable, self, nullptr, nullptr);
+  self->mpris_player_reg = g_dbus_connection_register_object(
+      conn, "/org/mpris/MediaPlayer2", g_mpris_node->interfaces[1],
+      &kPlayerVtable, self, nullptr, nullptr);
+}
+
+static void mpris_setup(LullAudioPlugin* self) {
+  self->mpris_owner_id = g_bus_own_name(
+      G_BUS_TYPE_SESSION, "org.mpris.MediaPlayer2.lull_audio",
+      G_BUS_NAME_OWNER_FLAGS_NONE, mpris_on_bus_acquired, nullptr, nullptr,
+      self, nullptr);
+}
+
 // ─── Method call handling ────────────────────────────────────────────────────
 
 FlMethodResponse* get_platform_version() {
@@ -244,12 +475,18 @@ static void lull_audio_plugin_handle_method_call(LullAudioPlugin* self,
     response = ok();
   } else if (strcmp(method, "play") == 0) {
     gst_element_set_state(self->playbin, GST_STATE_PLAYING);
+    self->mpris_playing = TRUE;
+    mpris_emit_changed(self);
     response = ok();
   } else if (strcmp(method, "pause") == 0) {
     gst_element_set_state(self->playbin, GST_STATE_PAUSED);
+    self->mpris_playing = FALSE;
+    mpris_emit_changed(self);
     response = ok();
   } else if (strcmp(method, "stop") == 0) {
     gst_element_set_state(self->playbin, GST_STATE_READY);
+    self->mpris_playing = FALSE;
+    mpris_emit_changed(self);
     response = ok();
   } else if (strcmp(method, "seek") == 0) {
     FlValue* v = args ? fl_value_lookup_string(args, "positionMs") : nullptr;
@@ -276,16 +513,26 @@ static void lull_audio_plugin_handle_method_call(LullAudioPlugin* self,
   } else if (strcmp(method, "setNowPlaying") == 0) {
     g_clear_pointer(&self->np_title, g_free);
     g_clear_pointer(&self->np_artist, g_free);
+    g_clear_pointer(&self->np_art_url, g_free);
+    self->np_length_us = 0;
     if (args != nullptr) {
       FlValue* t = fl_value_lookup_string(args, "title");
       FlValue* a = fl_value_lookup_string(args, "artist");
+      FlValue* art = fl_value_lookup_string(args, "artworkUri");
+      FlValue* dur = fl_value_lookup_string(args, "durationMs");
       if (t != nullptr) self->np_title = g_strdup(fl_value_get_string(t));
       if (a != nullptr) self->np_artist = g_strdup(fl_value_get_string(a));
+      if (art != nullptr) self->np_art_url = g_strdup(fl_value_get_string(art));
+      if (dur != nullptr) self->np_length_us = fl_value_get_int(dur) * 1000;
     }
-    response = ok();  // MPRIS publish lands in the next step.
+    mpris_emit_changed(self);
+    response = ok();
   } else if (strcmp(method, "clearNowPlaying") == 0) {
     g_clear_pointer(&self->np_title, g_free);
     g_clear_pointer(&self->np_artist, g_free);
+    g_clear_pointer(&self->np_art_url, g_free);
+    self->np_length_us = 0;
+    mpris_emit_changed(self);
     response = ok();
   } else {
     response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
@@ -350,9 +597,22 @@ static void lull_audio_plugin_dispose(GObject* object) {
   }
   g_list_free(self->temp_files);
   self->temp_files = nullptr;
+  if (self->mpris_player_reg != 0 && self->mpris_conn != nullptr) {
+    g_dbus_connection_unregister_object(self->mpris_conn, self->mpris_player_reg);
+    self->mpris_player_reg = 0;
+  }
+  if (self->mpris_root_reg != 0 && self->mpris_conn != nullptr) {
+    g_dbus_connection_unregister_object(self->mpris_conn, self->mpris_root_reg);
+    self->mpris_root_reg = 0;
+  }
+  if (self->mpris_owner_id != 0) {
+    g_bus_unown_name(self->mpris_owner_id);
+    self->mpris_owner_id = 0;
+  }
   g_clear_object(&self->event_channel);
   g_clear_pointer(&self->np_title, g_free);
   g_clear_pointer(&self->np_artist, g_free);
+  g_clear_pointer(&self->np_art_url, g_free);
   G_OBJECT_CLASS(lull_audio_plugin_parent_class)->dispose(object);
 }
 
@@ -396,6 +656,8 @@ void lull_audio_plugin_register_with_registrar(FlPluginRegistrar* registrar) {
   fl_event_channel_set_stream_handlers(self->event_channel, listen_cb,
                                        cancel_cb, g_object_ref(self),
                                        g_object_unref);
+
+  mpris_setup(self);
 
   g_object_unref(self);
 }
