@@ -40,10 +40,12 @@ flutter:
         pluginClass: LullAudioPlugin
       ios:
         pluginClass: LullAudioPlugin
+        sharedDarwinSource: true
       linux:
         pluginClass: LullAudioPlugin
       macos:
         pluginClass: LullAudioPlugin
+        sharedDarwinSource: true
 
   # To add assets to your plugin package, add an assets section, like this:
   # assets:
